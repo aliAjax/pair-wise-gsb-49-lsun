@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>赔案详情 - 再保险合约与巨灾暴露管理</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
+    main { max-width: 1080px; margin: auto; }
+    button { padding: .45rem .8rem; cursor: pointer; }
+    input, select { padding: .4rem .55rem; border: 1px solid #c4ccd4; border-radius: 6px; }
+    pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
+    section { border: 1px solid #e0e5ea; border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
+    .kv { display: grid; grid-template-columns: 14rem 1fr; gap: .25rem .8rem; font-size: .92rem; }
+    .kv dt { color: #5b6770; }
+    .kv dd { margin: 0; }
+    table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+    th, td { border: 1px solid #d8dee4; padding: .35rem .5rem; text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    .gap { background: #fdecea; border-color: #e6b0aa; }
+    .ok { color: #1e7d4f; }
+    .row { display:flex; gap:.6rem; align-items:center; flex-wrap: wrap; margin: .5rem 0; }
+    .tag { display:inline-block; padding:.1rem .5rem; border-radius:10px; background:#eef2f6; }
+    h2 { margin-top:0; font-size: 1.1rem; }
+  </style>
+</head>
+<body>
+<main>
+  <p><a href="/">← 返回列表</a></p>
+  <h1 id="title">赔案详情</h1>
+  <div id="alert"></div>
+
+  <section>
+    <h2>合约与额度（人民币）</h2>
+    <dl class="kv" id="contract"></dl>
+  </section>
+
+  <section>
+    <h2>原币报损与汇率占用</h2>
+    <dl class="kv" id="loss"></dl>
+  </section>
+
+  <section id="billSection" hidden>
+    <h2>已冻结结算账单</h2>
+    <p class="ok">账单已冻结，后续维护的新汇率不会改动本账单。</p>
+    <dl class="kv" id="bill"></dl>
+  </section>
+
+  <section>
+    <h2>批次归属</h2>
+    <div id="batches"></div>
+  </section>
+
+  <section>
+    <h2>操作</h2>
+    <div id="actions"></div>
+  </section>
+
+  <section>
+    <h2>审计时间线</h2>
+    <table id="audit"><thead><tr><th>动作</th><th>操作人</th><th>版本</th><th>时间</th><th>摘要/汇率</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+<script>
+const headers = {"Content-Type":"application/json","X-User-Id":"demo-finance","X-Role":"finance","X-Org":"demo"};
+const params = new URLSearchParams(location.search);
+const id = params.get("id");
+const fmt = v => (v === null || v === undefined || v === "") ? "—" : v;
+const rows = obj => Object.entries(obj).map(([k,v]) => `<dt>${k}</dt><dd>${typeof v === "object" ? `<pre>${JSON.stringify(v,null,2)}</pre>` : v}</dd>`).join("");
+
+async function call(path, options) {
+  const res = await fetch(path, Object.assign({headers}, options || {}));
+  const data = await res.json();
+  if (!res.ok) { showAlertError(data); throw data; }
+  hideAlert();
+  return data;
+}
+function showAlertError(data) {
+  const el = document.getElementById("alert");
+  let extra = "";
+  if (data.details) {
+    const d = data.details;
+    if (d.reason === "capacity_shortfall") {
+      extra = `<div class="gap" style="padding:.8rem;border-radius:8px;margin-top:.5rem">
+        <b>额度缺口（${d.stage === "settlement" ? "结算" : "核定占用"}阶段）</b>
+        <table><thead><tr><th>案件</th><th>币种</th><th>原币金额</th><th>折人民币</th><th>状态</th></tr></thead><tbody>
+        ${(d.lines||[]).map(l=>`<tr class="${l.current?'gap':''}"><td>${l.reference}${l.current?'（当前）':''}</td><td>${l.currency}</td><td>${fmt(l.foreign_amount)}</td><td>${fmt(l.cny_amount)}</td><td>${l.state}</td></tr>`).join("")}
+        </tbody></table>
+        <p style="margin-bottom:.2rem">原币金额：<b>${fmt(d.foreign_amount)} ${d.currency}</b>　折人民币：<b>￥${fmt(d.claimed_cny)}</b></p>
+        <p style="margin-bottom:.2rem">合约容量：￥${fmt(d.capacity_cny)}｜已用：￥${fmt(d.used_cny)}｜可用：￥${fmt(d.available_cny)}</p>
+        <p style="margin-bottom:0">缺口：<b style="color:#c0392b">￥${fmt(d.gap_cny)}</b></p>
+      </div>`;
+    } else {
+      extra = `<pre>${JSON.stringify(d,null,2)}</pre>`;
+    }
+  }
+  el.innerHTML = `<div class="gap" style="padding:.7rem;border-radius:8px"><b>[${data.error}]</b> ${data.message || ""}${extra}</div>`;
+}
+function hideAlert(){ document.getElementById("alert").innerHTML = ""; }
+
+async function act(action, data, version) {
+  await call(`/api/records/${id}/actions/${action}`, {method:"POST", body: JSON.stringify({expected_version: version, data})});
+  load();
+}
+
+function actionPanel(record) {
+  const v = record.version;
+  const state = record.state;
+  const blocks = [];
+  if (state === "quoted") blocks.push(`<div class="row"><button onclick="act('bind',{underwriter_id:'UW-WEB'},${v})">绑定合约（underwriter）</button></div>`);
+  if (state === "bound") blocks.push(`
+    <div class="row">
+      <input id="claimNo" placeholder="赔案号">
+      <input id="eventId" placeholder="巨灾事件ID" value="${record.payload.event_id||''}">
+      <select id="ccy"><option>USD</option><option>EUR</option><option>GBP</option><option>JPY</option><option>HKD</option><option>CNY</option></select>
+      <input id="lossAmt" placeholder="原币报损金额">
+      <input id="lossDate" type="date">
+      <button onclick="submitClaim(${v})">提交赔案（按报损日）</button>
+    </div>`);
+  if (state === "claim_submitted") blocks.push(`
+    <div class="row">
+      <input id="approved" placeholder="核定原币金额" value="${fmt(record.payload.loss_amount_foreign)}">
+      <button onclick="act('calculate',{approved_loss: parseFloat(document.getElementById('approved').value)},${v})">核定并占用额度（报损日汇率）</button>
+    </div>`);
+  if (state === "calculated") blocks.push(`
+    <div class="row">
+      <input id="payRef" placeholder="付款流水号">
+      <input id="settleDate" type="date">
+      <button onclick="settle(${v})">结算（按结算日汇率冻结账单）</button>
+    </div>`);
+  document.getElementById("actions").innerHTML = blocks.join("") || "<p class='tag'>当前状态无可用动作</p>";
+}
+async function submitClaim(v) {
+  await act("submit_claim", {
+    claim_number: document.getElementById("claimNo").value,
+    event_id: document.getElementById("eventId").value,
+    loss_currency: document.getElementById("ccy").value,
+    loss_amount: parseFloat(document.getElementById("lossAmt").value),
+    loss_date: document.getElementById("lossDate").value || undefined
+  }, v);
+}
+async function settle(v) {
+  await act("settle", {
+    payment_reference: document.getElementById("payRef").value,
+    settle_date: document.getElementById("settleDate").value || undefined
+  }, v);
+}
+
+async function load() {
+  if (!id) { document.getElementById("title").textContent = "缺少 id 参数"; return; }
+  const record = await call(`/api/records/${id}`);
+  const auditData = await call(`/api/records/${id}/audit`);
+  const timeline = auditData.items || [];
+  const batchData = auditData.batches || [];
+  const p = record.payload;
+  document.getElementById("title").innerHTML = `#${record.id} ${record.reference} <span class="tag">${record.state}</span>`;
+  document.getElementById("contract").innerHTML = rows({
+    "巨灾事件": p.event_id,
+    "合约币种": p.contract_currency || "CNY",
+    "起赔点(￥)": p.attachment, "限额(￥)": p.limit,
+    "层宽(￥)": p.layer_width, "分出比例": p.cession_pct,
+    "事件前累计占用(￥)": p.aggregate_prior,
+    "容量=层宽×分出比例(￥)": (p.layer_width * p.cession_pct).toFixed(2)
+  });
+  const lossInfo = {
+    "赔案号": p.claim_number, "报损币种": p.loss_currency || "CNY",
+    "报损日": p.loss_date,
+    "原币报损金额": fmt(p.loss_amount_foreign ?? p.loss_amount),
+    "报损日汇率": p.loss_fx ? `${p.loss_fx.rate}（${p.loss_fx.rate_date}）` : "—",
+    "报损折人民币(￥)": fmt(p.loss_amount_cny),
+    "核定原币金额": fmt(p.approved_loss_foreign),
+    "核定占用汇率": p.occupancy_fx ? `${p.occupancy_fx.rate}（${p.occupancy_fx.rate_date}）` : "—",
+    "核定原币摊回": fmt(p.recoverable_amount_foreign),
+    "核定占用人民币(￥)": fmt(p.recoverable_amount_cny ?? p.recoverable_amount),
+    "恢复保费(￥)": fmt(p.reinstatement_premium),
+    "净自留(￥)": fmt(p.net_retention)
+  };
+  document.getElementById("loss").innerHTML = rows(lossInfo);
+  if (p.bill) {
+    document.getElementById("billSection").hidden = false;
+    document.getElementById("bill").innerHTML = rows({
+      "付款流水号": p.bill.payment_reference,
+      "结算日": p.bill.settle_date,
+      "冻结汇率": `${p.bill.settlement_fx.rate}（${p.bill.settlement_fx.rate_date}）`,
+      "占用时汇率": p.bill.occupancy_fx ? `${p.bill.occupancy_fx.rate}（${p.bill.occupancy_fx.rate_date}）` : "—",
+      "原币付款": `${fmt(p.bill.payment_amount_foreign)} ${p.bill.currency}`,
+      "人民币付款(￥)": fmt(p.bill.payment_amount_cny),
+      "核定占用人民币(￥)": fmt(p.bill.occupied_amount_cny),
+      "汇率影响差额(￥)": fmt(p.bill.fx_delta_cny),
+      "账单冻结": p.bill.frozen ? "是" : "否"
+    });
+  }
+  document.getElementById("batches").innerHTML = batchData.length ? `<table><thead><tr><th>批次</th><th>币种</th><th>原币金额</th><th>人民币</th><th>结算日</th><th>汇率</th></tr></thead><tbody>${
+    batchData.map(b=>`<tr><td>#${b.id} ${b.reference}</td><td>${b.currency}</td><td>${b.foreign_amount}</td><td>${b.cny_amount}</td><td>${b.rate_date}</td><td>${b.rate}</td></tr>`).join("")
+  }</tbody></table>` : "<p>未加入结算批次。</p>";
+  document.querySelector("#audit tbody").innerHTML = timeline.map(e=>`<tr><td>${e.action}</td><td>${e.actor_id}</td><td>${e.version}</td><td>${e.created_at}</td><td>${(e.details&&e.details.summary)||""}${e.details&&e.details.fx&&Object.keys(e.details.fx).length?`<pre>${JSON.stringify(e.details.fx)}</pre>`:""}</td></tr>`).join("");
+  actionPanel(record);
+}
+load().catch(()=>{});
+</script>
+</body>
+</html>

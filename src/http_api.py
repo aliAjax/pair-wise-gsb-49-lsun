@@ -12,6 +12,10 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+BATCH_RE = re.compile(r"^/api/batches/(\d+)$")
+BATCH_ITEMS_RE = re.compile(r"^/api/batches/(\d+)/records/(\d+)$")
+BATCH_RECONCILE_RE = re.compile(r"^/api/batches/(\d+)/reconcile$")
+RATE_RE = re.compile(r"^/api/fx/rates/([A-Za-z]{3})/(\d{4}-\d{2}-\d{2})$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -57,9 +61,23 @@ def make_handler(service: Any, static_dir: Path):
 
         def _handle_error(self, exc: Exception) -> None:
             if isinstance(exc, DomainError):
-                self._send(exc.status, {"error": exc.code, "message": str(exc)})
+                payload = {"error": exc.code, "message": str(exc)}
+                if getattr(exc, "details", None):
+                    payload["details"] = exc.details
+                self._send(exc.status, payload)
             else:
                 self._send(500, {"error": "internal_error", "message": "服务内部错误"})
+
+        def _static(self, parsed_path: str) -> bool:
+            if parsed_path in ("/", "/index.html"):
+                page = (static_dir / "index.html").read_bytes()
+                self._send(200, page, "text/html; charset=utf-8")
+                return True
+            if parsed_path == "/claim.html":
+                page = (static_dir / "claim.html").read_bytes()
+                self._send(200, page, "text/html; charset=utf-8")
+                return True
+            return False
 
         def do_GET(self) -> None:
             try:
@@ -67,14 +85,44 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/health":
                     self._send(200, {"status": "ok", "service": "reinsurance-exposure", "database": service.repository.health()})
                     return
-                if parsed.path == "/":
-                    page = (static_dir / "index.html").read_bytes()
-                    self._send(200, page, "text/html; charset=utf-8")
+                if self._static(parsed.path):
                     return
+                query = parse_qs(parsed.query)
                 if parsed.path == "/api/records":
-                    query = parse_qs(parsed.query)
-                    records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
+                    records = service.list_records(
+                        self._actor(),
+                        state=query.get("state", [None])[0],
+                        limit=int(query.get("limit", ["100"])[0]),
+                        event_id=query.get("event_id", [None])[0],
+                    )
                     self._send(200, {"items": records})
+                    return
+                if parsed.path == "/api/fx/rates":
+                    rows = service.list_rates(
+                        self._actor(),
+                        currency=query.get("currency", [None])[0],
+                        limit=int(query.get("limit", ["200"])[0]),
+                    )
+                    self._send(200, {"items": rows})
+                    return
+                match = RATE_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_rate(self._actor(), match.group(1).upper(), match.group(2)))
+                    return
+                if parsed.path == "/api/batches":
+                    self._send(200, {"items": service.list_batches(self._actor(), int(query.get("limit", ["100"])[0]))})
+                    return
+                match = BATCH_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_batch(self._actor(), int(match.group(1))))
+                    return
+                match = BATCH_RECONCILE_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.reconcile_batch(self._actor(), int(match.group(1))))
+                    return
+                if parsed.path == "/api/reconcile/event":
+                    event_id = query.get("event_id", [None])[0]
+                    self._send(200, service.reconcile_event(self._actor(), event_id))
                     return
                 match = RECORD_RE.match(parsed.path)
                 if match:
@@ -82,7 +130,9 @@ def make_handler(service: Any, static_dir: Path):
                     return
                 match = AUDIT_RE.match(parsed.path)
                 if match:
-                    self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
+                    record_id = int(match.group(1))
+                    self._send(200, {"items": service.timeline(self._actor(), record_id),
+                                     "batches": service.batches_for_record(self._actor(), record_id)})
                     return
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
@@ -98,6 +148,17 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
+                    return
+                if parsed.path == "/api/fx/rates":
+                    self._send(201, service.upsert_rate(self._actor(), body.get("data", body)))
+                    return
+                if parsed.path == "/api/batches":
+                    self._send(201, service.create_batch(self._actor(), body.get("data", body)))
+                    return
+                match = BATCH_ITEMS_RE.match(parsed.path)
+                if match:
+                    item = service.add_batch_item(self._actor(), int(match.group(1)), int(match.group(2)))
+                    self._send(201, item)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:

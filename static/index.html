@@ -6,28 +6,116 @@
   <title>再保险合约与巨灾暴露管理</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
-    button { padding: .55rem .9rem; cursor: pointer; }
+    main { max-width: 1080px; margin: auto; }
+    button { padding: .5rem .85rem; cursor: pointer; }
     pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    .row { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; margin: .5rem 0; }
+    input, select { padding: .45rem .6rem; border: 1px solid #c4ccd4; border-radius: 6px; }
+    table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+    th, td { border: 1px solid #d8dee4; padding: .4rem .55rem; text-align: right; }
+    th:first-child, td:first-child, td.l { text-align: left; }
+    tr.gap td { background: #fdecea; }
+    .tag { display:inline-block; padding:.1rem .45rem; border-radius:10px; background:#eef2f6; font-size:.78rem; }
+    h2 { margin-top: 2rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>再保险合约与巨灾暴露管理</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
-  <pre id="output">点击上方按钮读取服务状态。</pre>
+  <p>海外巨灾赔案按原币报损，合约额度以人民币计价：核定按报损日汇率占用，结算按结算日汇率换算并冻结账单，批次按币种汇总。</p>
+
+  <div class="row">
+    <button id="load">加载案件</button>
+    <input id="eventId" placeholder="按巨灾事件ID筛选，如 CAT-2026-01">
+    <button id="reconcile">按事件核对</button>
+    <button id="rates">汇率资料</button>
+    <button id="batches">结算批次</button>
+  </div>
+  <div id="view"></div>
+
+  <h2>案件详情</h2>
+  <div class="row"><input id="claimId" placeholder="输入案件ID"><button id="openClaim">打开详情页</button></div>
 </main>
 <script>
 const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
-  const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+const view = document.getElementById("view");
+async function getJson(path, options) {
+  const response = await fetch(path, Object.assign({headers}, options || {}));
+  return {status: response.status, data: await response.json()};
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+function fmt(v) { return v === null || v === undefined ? "—" : v; }
+function recordsTable(items) {
+  const rows = items.map(r => {
+    const p = r.payload || {};
+    const ccy = p.loss_currency || "CNY";
+    return `<tr>
+      <td class="l"><a href="/claim.html?id=${r.id}">#${r.id} ${r.reference}</a></td>
+      <td class="l">${p.claim_event_id || p.event_id || ""}</td>
+      <td class="l"><span class="tag">${r.state}</span></td>
+      <td>${ccy}</td>
+      <td>${fmt(p.approved_loss_foreign ?? p.loss_amount_foreign)}</td>
+      <td>${fmt(p.recoverable_amount_cny ?? p.recoverable_amount)}</td>
+      <td>${fmt(p.payment_amount_cny)}</td>
+      <td>${fmt(p.settlement_fx && p.settlement_fx.rate)}</td>
+    </tr>`;
+  }).join("");
+  return `<table><thead><tr><th>案件</th><th>巨灾事件</th><th>状态</th><th>币种</th><th>原币金额</th><th>核定占用(￥)</th><th>结算付款(￥)</th><th>结算汇率</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function summaryTable(summary) {
+  if (!summary || !summary.length) return "<p>无数据。</p>";
+  return `<table><thead><tr><th>币种</th><th>笔数</th><th>原币合计</th><th>折人民币合计</th></tr></thead><tbody>` +
+    summary.map(s => `<tr><td class="l">${s.currency} ${s.currency_label}</td><td>${s.count}</td><td>${s.foreign_total}</td><td>${s.cny_total}</td></tr>`).join("") +
+    `</tbody></table>`;
+}
+document.getElementById("load").onclick = async () => {
+  const eventId = document.getElementById("eventId").value.trim();
+  const qs = eventId ? ("?event_id=" + encodeURIComponent(eventId)) : "";
+  const {data} = await getJson("/api/records?limit=50" + qs);
+  view.innerHTML = recordsTable(data.items || []);
+};
+document.getElementById("reconcile").onclick = async () => {
+  const eventId = document.getElementById("eventId").value.trim();
+  if (!eventId) { view.textContent = "请先输入巨灾事件ID。"; return; }
+  const {data} = await getJson("/api/reconcile/event?event_id=" + encodeURIComponent(eventId));
+  view.innerHTML = `<h2>事件 ${eventId} 核对</h2>
+    <p>合约容量 ￥${data.capacity_cny}｜已用 ￥${data.used_cny}｜可用 ￥${data.available_cny}｜缺口 <b style="color:${data.gap_cny ? '#c0392b' : 'inherit'}">￥${data.gap_cny}</b></p>
+    <h3>按币种汇总</h3>${summaryTable(data.summary)}
+    <h3>逐案口径</h3>${recordsTable(data.lines.map(l => ({id: l.record_id, reference: l.reference, state: l.state, payload: {
+      loss_currency: l.currency, claim_event_id: eventId,
+      approved_loss_foreign: l.approved_foreign ?? l.loss_foreign,
+      recoverable_amount_cny: l.occupied_cny, payment_amount_cny: l.payment_cny,
+      settlement_fx: {rate: l.settlement_fx}
+    }})))}`;
+};
+document.getElementById("rates").onclick = async () => {
+  const {data} = await getJson("/api/fx/rates?limit=100");
+  const rows = (data.items || []).map(r => `<tr><td class="l">${r.currency}</td><td>${r.rate_date}</td><td>${r.rate}</td><td class="l">${r.source || ""}</td></tr>`).join("");
+  view.innerHTML = `<h2>汇率资料（1单位外币兑人民币，取不晚于业务日的最近一条）</h2>
+    <table><thead><tr><th>币种</th><th>日期</th><th>汇率</th><th>来源</th></tr></thead><tbody>${rows}</tbody></table>`;
+};
+document.getElementById("batches").onclick = async () => {
+  const {data} = await getJson("/api/batches?limit=50");
+  const rows = (data.items || []).map(b => `<tr><td class="l"><a href="#" onclick="openBatch(${b.id});return false;">#${b.id} ${b.reference}</a></td><td>${b.currency}</td><td>${b.item_count}</td><td>${(b.summary[0] && b.summary[0].foreign_total) || 0}</td><td>${(b.summary[0] && b.summary[0].cny_total) || 0}</td></tr>`).join("");
+  view.innerHTML = `<h2>结算批次（按币种）</h2>
+    <table><thead><tr><th>批次</th><th>币种</th><th>笔数</th><th>原币合计</th><th>人民币合计</th></tr></thead><tbody>${rows}</tbody></table>
+    <div id="batchDetail"></div>`;
+};
+async function openBatch(id) {
+  const [{data: batch}, {data: recon}] = await Promise.all([
+    getJson("/api/batches/" + id), getJson("/api/batches/" + id + "/reconcile")
+  ]);
+  const itemRows = batch.items.map(i => `<tr class="${recon.items.find(x=>x.record_id===i.record_id && !x.consistent) ? 'gap' : ''}">
+    <td class="l"><a href="/claim.html?id=${i.record_id}">#${i.record_id} ${i.record_reference}</a></td>
+    <td>${i.currency}</td><td>${i.foreign_amount}</td><td>${i.cny_amount}</td><td>${i.rate_date}</td><td>${i.rate}</td>
+  </tr>`).join("");
+  document.getElementById("batchDetail").innerHTML = `<h3>批次 ${batch.reference}（核对${recon.consistent ? "一致" : "不一致"}）</h3>
+    ${summaryTable(batch.summary)}
+    <table><thead><tr><th>案件</th><th>币种</th><th>原币付款</th><th>人民币付款</th><th>结算日</th><th>冻结汇率</th></tr></thead><tbody>${itemRows}</tbody></table>`;
+}
+document.getElementById("openClaim").onclick = () => {
+  const id = document.getElementById("claimId").value.trim();
+  if (id) location.href = "/claim.html?id=" + encodeURIComponent(id);
+};
 </script>
 </body>
 </html>
