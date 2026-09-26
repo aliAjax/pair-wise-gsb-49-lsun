@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>赔案详情 - 再保险合约与巨灾暴露管理</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
+    main { max-width: 1080px; margin: auto; }
+    h2 { margin-top: 2rem; border-bottom: 2px solid #e3e8ee; padding-bottom: .3rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: .6rem; }
+    th, td { border: 1px solid #d7dee6; padding: .45rem .6rem; text-align: left; font-size: .92rem; }
+    th { background: #f4f6f8; }
+    button { padding: .55rem .9rem; cursor: pointer; }
+    input { padding: .45rem .6rem; width: 8rem; }
+    .row { display: flex; gap: .8rem; align-items: center; margin: .8rem 0; }
+    .muted { color: #5c6b7a; }
+    .warn { color: #b23b3b; font-weight: 600; }
+    pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>赔案详情</h1>
+  <div class="row">
+    <label>记录ID <input id="rid" type="number" min="1"></label>
+    <button id="load">加载</button>
+    <a href="/">返回列表页</a>
+    <span id="state" class="muted"></span>
+  </div>
+
+  <h2>基本信息</h2>
+  <table id="base"><tbody></tbody></table>
+
+  <h2>汇率与额度占用（核定冻结）</h2>
+  <table id="occupancy"><tbody></tbody></table>
+
+  <h2>结算账单（结算日冻结，不随新汇率改动）</h2>
+  <div id="bill" class="muted">尚未结算。</div>
+
+  <h2>结算批次（按币种汇总）</h2>
+  <div id="batch" class="muted">未加入批次。</div>
+
+  <h2>审计时间线</h2>
+  <table id="audit"><thead><tr><th>时间</th><th>动作</th><th>操作人</th><th>版本</th><th>明细</th></tr></thead><tbody></tbody></table>
+
+  <pre id="raw" hidden></pre>
+</main>
+<script>
+const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
+const fmt = (n) => (n === null || n === undefined || n === "") ? "—" : Number(n).toLocaleString("zh-CN", {maximumFractionDigits: 6});
+const txt = (v) => (v === null || v === undefined || v === "") ? "—" : v;
+
+function rows(table, pairs) {
+  const body = table.querySelector("tbody");
+  body.innerHTML = "";
+  for (const [k, v] of pairs) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<th>${k}</th><td>${v}</td>`;
+    body.appendChild(tr);
+  }
+}
+
+function rateLine(q) {
+  if (!q) return "—";
+  return `1 ${q.currency} = ${q.rate} CNY（${q.date || "基准"}${q.source ? "，来源：" + q.source : ""}）`;
+}
+
+async function load(id) {
+  const [recordRes, auditRes] = await Promise.all([
+    fetch(`/api/records/${id}`, {headers}),
+    fetch(`/api/records/${id}/audit`, {headers}),
+  ]);
+  const record = await recordRes.json();
+  if (!recordRes.ok) { alert(record.message || "加载失败"); return; }
+  const audit = (await auditRes.json()).items || [];
+  const p = record.payload || {};
+  document.getElementById("state").textContent = `状态：${record.state}　版本：${record.version}`;
+
+  rows(document.getElementById("base"), [
+    ["合约/事件", `${record.reference} / ${txt(p.event_id)}`],
+    ["赔案号", txt(p.claim_number)],
+    ["报损币种", txt(p.loss_currency)],
+    ["报损金额（原币）", fmt(p.reported_loss_fc)],
+    ["报损日期", txt(p.loss_report_date)],
+    ["核定损失（原币）", fmt(p.approved_loss_fc)],
+    ["核定损失（折人民币）", fmt(p.approved_loss)],
+  ]);
+
+  rows(document.getElementById("occupancy"), [
+    ["报损日汇率", rateLine(p.report_rate)],
+    ["摊回（原币）", fmt(p.recoverable_fc)],
+    ["额度占用（人民币，按报损日汇率冻结）", fmt(p.recoverable_amount)],
+    ["恢复保费（人民币）", fmt(p.reinstatement_premium)],
+  ]);
+
+  const billBox = document.getElementById("bill");
+  if (record.bill) {
+    const b = record.bill;
+    billBox.className = "";
+    billBox.innerHTML = `<table><tbody>
+      <tr><th>账单号</th><td>BILL-${b.id}</td><th>状态</th><td>${b.status}</td></tr>
+      <tr><th>应付（原币）</th><td>${fmt(b.amount_fc)} ${b.currency}</td><th>结算日汇率</th><td>${rateLine({currency: b.currency, rate: b.rate, date: b.rate_date})}</td></tr>
+      <tr><th>应付（折人民币）</th><td>${fmt(b.amount_cny)}</td><th>结算日期</th><td>${txt(b.rate_date)}</td></tr>
+      <tr><th>核定占用（人民币）</th><td>${fmt(b.occupancy_cny)}</td><th>汇兑差异（人民币）</th><td class="${b.fx_variance_cny ? "warn" : ""}">${fmt(b.fx_variance_cny)}</td></tr>
+      <tr><th>支付参考号</th><td>${txt(b.payment_reference)}</td><th>冻结时间</th><td>${txt(b.created_at)}</td></tr>
+    </tbody></table>`;
+    loadBatch(b.id);
+  } else {
+    billBox.className = "muted";
+    billBox.textContent = "尚未结算。";
+    document.getElementById("batch").textContent = "未加入批次。";
+  }
+
+  const tbody = document.querySelector("#audit tbody");
+  tbody.innerHTML = "";
+  for (const ev of audit) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td>${ev.created_at}</td><td>${ev.action}</td><td>${ev.actor_id}</td><td>${ev.version}</td><td><code>${JSON.stringify(ev.details)}</code></td>`;
+    tbody.appendChild(tr);
+  }
+  document.getElementById("raw").textContent = JSON.stringify(record, null, 2);
+}
+
+async function loadBatch(billId) {
+  const box = document.getElementById("batch");
+  const res = await fetch("/api/batches?limit=100", {headers});
+  const data = await res.json();
+  for (const meta of data.items || []) {
+    const detail = await (await fetch(`/api/batches/${meta.id}`, {headers})).json();
+    if ((detail.bills || []).some((b) => b.id === billId)) {
+      const lines = (detail.summary_by_currency || []).map((s) =>
+        `<tr><td>${s.currency}</td><td>${s.count}</td><td>${fmt(s.amount_fc)}</td><td>${fmt(s.amount_cny)}</td><td>${fmt(s.fx_variance_cny)}</td></tr>`).join("");
+      box.className = "";
+      box.innerHTML = `<p>批次：${detail.reference}（${txt(detail.title)}）</p>
+        <table><thead><tr><th>币种</th><th>账单数</th><th>原币合计</th><th>折人民币合计</th><th>汇兑差异合计</th></tr></thead><tbody>${lines}</tbody></table>`;
+      return;
+    }
+  }
+  box.textContent = "未加入批次。";
+}
+
+document.getElementById("load").onclick = () => load(document.getElementById("rid").value);
+const params = new URLSearchParams(location.search);
+if (params.get("id")) {
+  document.getElementById("rid").value = params.get("id");
+  load(params.get("id"));
+}
+</script>
+</body>
+</html>

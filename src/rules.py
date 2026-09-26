@@ -1,7 +1,9 @@
 """再保险合约与巨灾暴露管理领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from . import fx
+from .currency import BASE_CURRENCY, FxQuote, is_base, require_currency
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, optional_text, text, text_list
 
 
 INITIAL_STATE = "quoted"
@@ -43,6 +45,7 @@ class DomainRules:
         width = float(p["limit"]) - float(p["attachment"])
         retained_loss = max(0.0, float(p["loss_amount"]) - float(p["attachment"]))
         recovery = min(retained_loss, width) * float(p["cession_pct"])
+        p["loss_currency"] = BASE_CURRENCY
         p["layer_width"] = round(width, 2)
         p["recoverable_amount"] = round(recovery, 2)
         p["reinstatement_premium"] = round(recovery * float(p["reinstatement_pct"]), 2)
@@ -67,7 +70,8 @@ class DomainRules:
             raise Conflict("当前状态不允许执行%s" % action)
         return allowed
 
-    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+    def apply_action(self, record: Dict[str, Any], action: str, data: Dict[str, Any],
+                     fx_ctx: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any], str]:
         new_state = self.require_transition(record, action)
         data = dict(data or {})
         p = dict(record["payload"])
@@ -79,19 +83,41 @@ class DomainRules:
         elif action == "submit_claim":
             changes["claim_number"] = text(data, "claim_number")
             changes["claim_event_id"] = text(data, "event_id")
+            currency = require_currency(optional_text(data, "currency", p.get("loss_currency", BASE_CURRENCY)) or BASE_CURRENCY)
+            changes["loss_currency"] = currency
+            if data.get("reported_loss") is not None:
+                changes["reported_loss_fc"] = number(data, "reported_loss", 0)
+            if data.get("loss_report_date") is not None and str(data.get("loss_report_date")).strip():
+                changes["loss_report_date"] = fx.parse_date(data.get("loss_report_date"), "loss_report_date")
+            if not is_base(currency) and not changes.get("loss_report_date"):
+                raise ValidationError("外币报损必须提供loss_report_date")
             summary = "赔案已提交"
         elif action == "calculate":
-            loss = number(data, "approved_loss", 0)
-            width = float(p["layer_width"])
-            recovery = min(max(0.0, loss - float(p["attachment"])), width) * float(p["cession_pct"])
-            changes["approved_loss"] = loss
-            changes["recoverable_amount"] = round(recovery, 2)
-            changes["reinstatement_premium"] = round(recovery * float(p["reinstatement_pct"]), 2)
+            loss_fc = number(data, "approved_loss", 0)
+            currency = p.get("loss_currency", BASE_CURRENCY)
+            quote = (fx_ctx or {}).get("quote") or fx.base_quote()
+            result = fx.assessment(loss_fc, float(p["attachment"]), float(p["layer_width"]), float(p["cession_pct"]), currency, quote)
+            changes["approved_loss_fc"] = loss_fc
+            changes["approved_loss"] = result["approved_loss_cny"]
+            changes["recoverable_fc"] = result["recoverable_fc"]
+            changes["recoverable_amount"] = result["occupancy_cny"]
+            changes["reinstatement_premium"] = round(result["occupancy_cny"] * float(p["reinstatement_pct"]), 2)
+            changes["report_rate"] = fx.quote_payload(result["quote"])
             summary = "摊回金额已计算"
         elif action == "settle":
             if float(p["recoverable_amount"]) <= 0:
                 raise ValidationError("无可结算摊回")
             changes["payment_reference"] = text(data, "payment_reference")
+            currency = p.get("loss_currency", BASE_CURRENCY)
+            quote = (fx_ctx or {}).get("quote") or fx.base_quote()
+            settle_date = (fx_ctx or {}).get("settle_date") or fx.today_utc()
+            result = fx.settlement(float(p.get("recoverable_fc", p["recoverable_amount"])), quote)
+            changes["settle_date"] = settle_date
+            changes["settle_rate"] = fx.quote_payload(result["quote"])
+            changes["payable_fc"] = result["payable_fc"]
+            changes["payable_cny"] = result["payable_cny"]
+            changes["occupancy_cny"] = float(p["recoverable_amount"])
+            changes["fx_variance_cny"] = round(result["payable_cny"] - float(p["recoverable_amount"]), 2)
             summary = "摊回赔款已结算"
         elif action == "reject":
             changes["reject_reason"] = text(data, "reject_reason")

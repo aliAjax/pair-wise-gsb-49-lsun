@@ -12,6 +12,10 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+FX_RATES_RE = re.compile(r"^/api/fx-rates$")
+BATCHES_RE = re.compile(r"^/api/batches$")
+BATCH_RE = re.compile(r"^/api/batches/(\d+)$")
+BATCH_ITEMS_RE = re.compile(r"^/api/batches/(\d+)/items$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -57,7 +61,10 @@ def make_handler(service: Any, static_dir: Path):
 
         def _handle_error(self, exc: Exception) -> None:
             if isinstance(exc, DomainError):
-                self._send(exc.status, {"error": exc.code, "message": str(exc)})
+                body = {"error": exc.code, "message": str(exc)}
+                if getattr(exc, "details", None):
+                    body["details"] = exc.details
+                self._send(exc.status, body)
             else:
                 self._send(500, {"error": "internal_error", "message": "服务内部错误"})
 
@@ -71,10 +78,27 @@ def make_handler(service: Any, static_dir: Path):
                     page = (static_dir / "index.html").read_bytes()
                     self._send(200, page, "text/html; charset=utf-8")
                     return
+                if parsed.path == "/claim":
+                    page = (static_dir / "claim.html").read_bytes()
+                    self._send(200, page, "text/html; charset=utf-8")
+                    return
                 if parsed.path == "/api/records":
                     query = parse_qs(parsed.query)
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
                     self._send(200, {"items": records})
+                    return
+                if FX_RATES_RE.match(parsed.path):
+                    query = parse_qs(parsed.query)
+                    items = service.list_fx_rates(self._actor(), currency=query.get("currency", [None])[0], limit=int(query.get("limit", ["200"])[0]))
+                    self._send(200, {"items": items})
+                    return
+                if BATCHES_RE.match(parsed.path):
+                    query = parse_qs(parsed.query)
+                    self._send(200, {"items": service.list_batches(self._actor(), limit=int(query.get("limit", ["100"])[0]))})
+                    return
+                match = BATCH_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_batch(self._actor(), int(match.group(1))))
                     return
                 match = RECORD_RE.match(parsed.path)
                 if match:
@@ -106,6 +130,18 @@ def make_handler(service: Any, static_dir: Path):
                         raise ValidationError("expected_version必须是整数")
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
+                    return
+                if FX_RATES_RE.match(parsed.path):
+                    self._send(200, service.upsert_fx_rate(self._actor(), body))
+                    return
+                if BATCHES_RE.match(parsed.path):
+                    batch = service.create_batch(self._actor(), body.get("reference", ""), body.get("title", ""))
+                    self._send(201, batch)
+                    return
+                match = BATCH_ITEMS_RE.match(parsed.path)
+                if match:
+                    batch = service.add_batch_item(self._actor(), int(match.group(1)), bill_id=body.get("bill_id"), record_id=body.get("record_id"))
+                    self._send(200, batch)
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:

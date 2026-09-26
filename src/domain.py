@@ -7,6 +7,10 @@ class DomainError(Exception):
     status = 400
     code = "domain_error"
 
+    def __init__(self, message: str, details: Dict[str, Any] = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
 
 class ValidationError(DomainError):
     status = 422
@@ -26,6 +30,12 @@ class Conflict(DomainError):
 class PermissionDenied(DomainError):
     status = 403
     code = "permission_denied"
+
+
+class CapacityShortfall(Conflict):
+    """核定时合约额度不足：明细含原币金额、折人民币金额与缺口。"""
+
+    code = "capacity_shortfall"
 
 
 @dataclass(frozen=True)
